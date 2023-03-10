@@ -1,0 +1,452 @@
+CREATE OR REPLACE PROCEDURE TS."tsp_CategorisationContact"
+    (ContactID VARCHAR2, StartDate DATE, DueDate DATE) IS
+ 
+CategorisationTypeID VARCHAR2(38);
+CurrenUserContactID VARCHAR2(38);
+-- Constants
+cTaskStateDone VARCHAR2(38) := '{F598ECDB-4EEF-4FA8-9E69-A36B053501E5}';
+IsPotentialOnVisit INT;
+TempPotentialID VARCHAR2(38);
+TempLoyaltyID VARCHAR2(38);
+TempPotentialNumber NUMBER(15,2);
+ContactTypeID VARCHAR2(38);
+SpecialtyID VARCHAR2(38);
+BEGIN
+
+    CurrenUserContactID := "fn_GetCurrentUserContactID"();
+    --CurrenUserContactID := '{F9D762C1-0DDF-45C9-A5AD-39D928963C26}';
+    BEGIN
+    SELECT tp."CategorisationTypeID", a."ContactTypeID", a."SpecialtyID"
+        INTO CategorisationTypeID, ContactTypeID, SpecialtyID
+    FROM "tbl_Contact" a 
+    INNER JOIN "tbl_ContactType" tp ON (a."ContactTypeID" = tp."ID")
+    WHERE a."ID" = ContactID
+    AND EXISTS(
+    SELECT 1 FROM ts."tbl_Task" t where 
+    trunc(t."StartDate") >= trunc(StartDate) AND trunc(t."DueDate") <= trunc(DueDate)
+    AND t."ContactID" = ContactID
+    )
+    ;
+
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            NULL;
+    END;
+
+    IF(CategorisationTypeID IS NULL) THEN RETURN; END IF;
+
+    -- Добавление новых МП
+    /*INSERT INTO "tbl_MedRepInContact" ("CreatedOn", "ModifiedOn", "CreatedByID", "ModifiedByID", "OwnerMRID", "ContactID",
+        "BusinessUnitID")
+    SELECT sysdate(), sysdate(), CurrenUserContactID, CurrenUserContactID, dia."OwnerMRID", ContactID,
+        o."BusinessUnitID"
+    FROM "tbl_DrugInContact" dia
+    INNER JOIN "tbl_Offering" o ON (o."ID" = dia."DrugID")
+    INNER JOIN "tbl_Contact" a ON (a."ID" = dia."ContactID")
+    WHERE dia."ContactID" = ContactID AND
+        NOT EXISTS (SELECT * FROM "tbl_MedRepInContact" WHERE "ContactID" = ContactID AND
+            NVL("OwnerMRID", ' ') = NVL(dia."OwnerMRID", ' ') AND 
+            NVL("BusinessUnitID", ' ') =  NVL(o."BusinessUnitID", ' ')) AND
+       dia."OwnerMRID" IS NOT NULL
+       AND EXISTS(
+    SELECT 1 FROM ts."tbl_Task" t where 
+    trunc(t."StartDate") >= trunc(StartDate) AND trunc(t."DueDate") <= trunc(DueDate)
+    AND t."ContactID" = ContactID AND t."ContactID" = dia."ContactID"
+    )
+    GROUP BY  dia."OwnerMRID", o."BusinessUnitID";*/
+
+    /********************************
+     * ПРЕПАРАТЫ
+     ********************************/
+    /*
+     * Расчет Лояльности препаратов
+     */
+     DECLARE CURSOR CRSR IS
+        SELECT DrugID,
+            Avg(CASE
+                WHEN NVL((LoyaltyRegionalCoef * LoyaltyCountryCoef), 0) = 0 THEN 0
+                ELSE TaskDrugLoyalty / (LoyaltyRegionalCoef * LoyaltyCountryCoef)
+            END) LoyaltyNumber
+        FROM(  SELECT dit."OfferingID" DrugID,
+                dit."Loyalty" TaskDrugLoyalty,
+                ("fn_OfferingLocationCoeff"(CategorisationTypeID, dit."OfferingID", a."CityID", a."StateID", NULL, t."StartDate", 0, 1)) LoyaltyRegionalCoef, -- Региональный коэффициент
+                ("fn_OfferingLocationCoeff"(CategorisationTypeID, dit."OfferingID", NULL, NULL, a."CountryID", t."StartDate", 0, 1)) LoyaltyCountryCoef -- Коэффициент страны
+            FROM "tbl_DrugInTask" dit
+            JOIN "tbl_Task" t ON (t."ID" = dit."TaskID")
+            JOIN "tbl_Contact" a ON (a."ID" = t."ContactID")
+            JOIN "tbl_DrugInContact" dia ON (dia."ContactID" = a."ID")
+            LEFT OUTER JOIN "tbl_TaskType" tt ON (t."TypeID" = tt."ID")
+            WHERE t."ContactID" = ContactID AND tt."ContactCategorisationTypeID" = CategorisationTypeID AND
+                trunc(t."StartDate") >= trunc(StartDate) AND trunc(t."DueDate") <= trunc(DueDate) AND
+                t."StatusID" = cTaskStateDone AND
+                dia."DrugID" = dit."OfferingID" AND
+                dia."OwnerMRID" = t."OwnerID") a GROUP BY DrugID;
+     c1rec CRSR%ROWTYPE;
+     BEGIN
+        OPEN CRSR;
+        LOOP
+           FETCH CRSR  INTO c1rec;
+           EXIT WHEN CRSR%NOTFOUND;
+           -- Установка лояльности у препаратов врача
+           UPDATE "tbl_DrugInContact"
+                SET "LoyaltyID" = "fn_OfferingLoyaltyIDByLevel"(c1rec.DrugID, c1rec.LoyaltyNumber, SpecialtyID),
+                    "LoyaltyNumber" = c1rec.LoyaltyNumber,
+                    "CategorisationDate" = SYSDATE
+           WHERE "ContactID" = ContactID AND "DrugID" = c1rec.DrugID;
+        END LOOP;
+        CLOSE CRSR;
+     END;
+
+     /*
+      * Установка потенциала у препаратов врача
+      */
+
+    DECLARE CURSOR CRSR IS
+        SELECT DrugID,
+            Avg(CASE
+                WHEN NVL((PotentialRegionalCoef * PotentialCountryCoef), 0) = 0 THEN 0
+                ELSE TaskDrugPotential / (PotentialRegionalCoef * PotentialCountryCoef)
+            END) PotentialNumber
+        FROM(  SELECT dit."OfferingID" DrugID,
+                dit."Potential" TaskDrugPotential,
+                ("fn_OfferingLocationCoeff"(CategorisationTypeID, dit."OfferingID", a."CityID", a."StateID", NULL, t."StartDate", 1, 0)) PotentialRegionalCoef, -- Региональный коэффициент
+                ("fn_OfferingLocationCoeff"(CategorisationTypeID, dit."OfferingID", NULL, NULL, a."CountryID", t."StartDate", 1, 0)) PotentialCountryCoef -- Коэффициент страны
+            FROM "tbl_DrugInTask" dit
+            JOIN "tbl_Task" t ON (t."ID" = dit."TaskID")
+            JOIN "tbl_Contact" a ON (a."ID" = t."ContactID")
+            JOIN "tbl_DrugInContact" dia ON (dia."ContactID" = a."ID")
+            LEFT OUTER JOIN "tbl_TaskType" tt ON (t."TypeID" = tt."ID")
+            WHERE t."ContactID" = ContactID AND tt."ContactCategorisationTypeID" = CategorisationTypeID AND
+                --t."DueDate" BETWEEN StartDate AND DueDate AND
+                trunc(t."StartDate") >= trunc(StartDate) AND trunc(t."DueDate") <= trunc(DueDate) AND
+                t."StatusID" = cTaskStateDone AND
+                dia."DrugID" = dit."OfferingID" AND
+                dia."OwnerMRID" = t."OwnerID") a GROUP BY DrugID;
+     c1rec CRSR%ROWTYPE;
+     BEGIN
+        OPEN CRSR;
+        LOOP
+           FETCH CRSR  INTO c1rec;
+           EXIT WHEN CRSR%NOTFOUND;
+           -- Установка потенциала у препаратов врача
+           UPDATE "tbl_DrugInContact"
+                SET "PotentialID" = "fn_OfferingPotentialIDByLevel"(c1rec.DrugID, c1rec.PotentialNumber, SpecialtyID),
+                    "PotentialNumber" = c1rec.PotentialNumber,
+                    "CategorisationDate" = SYSDATE
+           WHERE "ContactID" = ContactID AND "DrugID" = c1rec.DrugID;
+        END LOOP;
+        CLOSE CRSR;
+     END;
+
+    /* Обновление группы клиента в препаратах */
+    UPDATE "tbl_DrugInContact"
+        SET "ClientGroupID" = (
+            SELECT "TargetGroupID"
+            FROM "tbl_ClientCategory"
+            WHERE "LoyaltyID" = "tbl_DrugInContact"."LoyaltyID" AND
+                "PotentialID" = "tbl_DrugInContact"."PotentialID" AND
+                "CategorisationTypeID" = CategorisationTypeID AND
+                ROWNUM <= 1
+        ), "CategorisationDate" = SYSDATE
+    WHERE "ContactID" = ContactID;
+
+    /*
+     * Категоризация препаратов завершена. Сохранение истории категоризации
+     */
+    INSERT INTO "tbl_DrugInContactHistory" ("Date", "PotentialID", "LoyaltyID", "ClientGroupID", "DrugInContactID")
+    SELECT sysdate(), "PotentialID", "LoyaltyID", "ClientGroupID", "ID"
+    FROM "tbl_DrugInContact" d
+    WHERE "ContactID" = ContactID AND
+         NOT EXISTS (
+                SELECT *
+                FROM "tbl_DrugInContactHistory"
+                WHERE NVL("LoyaltyID", '0') = NVL(d."LoyaltyID", '0') AND NVL("PotentialID", '0') = NVL(d."PotentialID", '0') AND
+                    NVL("ClientGroupID", '0') = NVL(d."ClientGroupID", '0') AND "DrugInContactID" = d."ID" AND
+                    "Date" = (SELECT Max("Date") FROM "tbl_DrugInContactHistory" WHERE "DrugInContactID" = d."ID")
+            );
+
+   /********************************
+     * МП
+     ********************************/
+   -- Лояльность МП
+   DECLARE CURSOR CRSR IS
+        SELECT OwnerMRID,
+               BusinessUnitID,
+               Sum(LoyaltyNumber * DrugPrice) LoyaltyPrice
+            FROM(
+                SELECT dia."OwnerMRID" OwnerMRID,
+                   o."BusinessUnitID" BusinessUnitID,
+                   dia."LoyaltyNumber" LoyaltyNumber,
+                   (
+                        SELECT Max("BasicPrice") FROM "tbl_OfferingPrice"
+                        WHERE "OfferingID" = dia."DrugID" AND "CountryID" = a."CountryID"
+                   ) DrugPrice
+                FROM "tbl_DrugInContact" dia
+                INNER JOIN "tbl_Offering" o ON (o."ID" = dia."DrugID")
+                INNER JOIN "tbl_Contact" a ON (a."ID" = dia."ContactID")
+                WHERE dia."ContactID" = ContactID
+            ) a GROUP BY OwnerMRID, BusinessUnitID;
+         c1rec CRSR%ROWTYPE;
+         BEGIN
+            OPEN CRSR;
+            LOOP
+               FETCH CRSR  INTO c1rec;
+               EXIT WHEN CRSR%NOTFOUND;
+               -- Лояльность
+               BEGIN
+               SELECT LoyaltyID INTO TempLoyaltyID
+               FROM (
+                   SELECT LoyaltyID, "MinValue",
+                        ROW_NUMBER() OVER ( ORDER BY "MinValue" DESC) row_num
+                   FROM (
+                    SELECT dl."LoyaltyID" LoyaltyID,
+                       Sum((
+                            SELECT Max("BasicPrice") FROM "tbl_OfferingPrice"
+                            WHERE "OfferingID" = dia."DrugID" AND "CountryID" = a."CountryID"
+                       ) * dl."MinValue")  "MinValue"
+                    FROM "tbl_DrugInContact" dia
+                    INNER JOIN "tbl_Offering" o ON (o."ID" = dia."DrugID")
+                    INNER JOIN "tbl_Contact" a ON (a."ID" = dia."ContactID")
+                    INNER JOIN "tbl_DrugLevels" dl ON (dia."DrugID" = dl."OfferingID")
+                    WHERE dia."ContactID" = ContactID AND
+                        dia."OwnerMRID" = c1rec.OwnerMRID AND dl."IsForLoyalty" = 1 AND
+                        dl."SpecialtyID" = SpecialtyID AND
+                        o."BusinessUnitID" = c1rec.BusinessUnitID
+                    GROUP BY dl."LoyaltyID", dl."ID"
+                 ) a
+                 WHERE "MinValue"  <= c1rec.LoyaltyPrice
+               ) b WHERE row_num = 1;
+               EXCEPTION
+               WHEN NO_DATA_FOUND THEN
+                       NULL;
+               END;
+
+               UPDATE "tbl_MedRepInContact"
+                    SET "LoyaltyID" = TempLoyaltyID
+               WHERE "ContactID" = ContactID AND "OwnerMRID" = c1rec.OwnerMRID AND
+                    "BusinessUnitID" = c1rec.BusinessUnitID;
+
+            END LOOP;
+            CLOSE CRSR;
+         END;
+
+   -- Потенциал МП
+   DECLARE CURSOR CRSR IS
+        SELECT OwnerMRID,
+                Sum(PotentialNumber * DrugPrice) PotentialPrice
+            FROM(
+                SELECT dia."OwnerMRID" OwnerMRID,
+                   dia."PotentialNumber" PotentialNumber,
+                   (
+                        SELECT Max("BasicPrice") FROM "tbl_OfferingPrice"
+                        WHERE "OfferingID" = dia."DrugID" AND "CountryID" = a."CountryID"
+                   ) DrugPrice
+                FROM "tbl_DrugInContact" dia
+                INNER JOIN "tbl_Contact" a ON (a."ID" = dia."ContactID")
+                WHERE dia."ContactID" = ContactID
+            ) a GROUP BY OwnerMRID;
+         c1rec CRSR%ROWTYPE;
+         BEGIN
+            OPEN CRSR;
+            LOOP
+               FETCH CRSR  INTO c1rec;
+               EXIT WHEN CRSR%NOTFOUND;
+               -- Потенциал
+               BEGIN
+               SELECT PotentialID INTO TempPotentialID
+               FROM (
+                   SELECT PotentialID, "MinValue",
+                        ROW_NUMBER() OVER ( ORDER BY "MinValue" DESC) row_num
+                   FROM (
+                    SELECT dl."PotentialID" PotentialID,
+                       Sum((
+                            SELECT Max("BasicPrice") FROM "tbl_OfferingPrice"
+                            WHERE "OfferingID" = dia."DrugID" AND "CountryID" = a."CountryID"
+                       ) * dl."MinValue")  "MinValue"
+                    FROM "tbl_DrugInContact" dia
+                    INNER JOIN "tbl_Contact" a ON (a."ID" = dia."ContactID")
+                    INNER JOIN "tbl_DrugLevels" dl ON (dia."DrugID" = dl."OfferingID")
+                    WHERE dia."ContactID" = ContactID AND
+                        dia."OwnerMRID" = c1rec.OwnerMRID AND dl."IsForPotential" = 1 AND
+                        dl."SpecialtyID" = SpecialtyID -- K.Pihalo 02.11.2012 @164161
+                    GROUP BY dl."PotentialID", dl."ID"
+                    ) a
+                   WHERE "MinValue"  <= c1rec.PotentialPrice
+               ) b WHERE row_num = 1;
+                EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                        NULL;
+                END;
+
+               UPDATE "tbl_MedRepInContact"
+                    SET "PotentialID" = TempPotentialID
+               WHERE "ContactID" = ContactID AND "OwnerMRID" = c1rec.OwnerMRID;
+
+            END LOOP;
+            CLOSE CRSR;
+         END;
+
+   -- Лояльность и потенциал врача
+   DECLARE CURSOR CRSR IS
+        SELECT
+                Sum(LoyaltyNumber * DrugPrice) LoyaltyPrice,
+                Sum(PotentialNumber * DrugPrice) PotentialPrice
+            FROM(
+                SELECT dia."OwnerMRID" OwnerMRID,
+                   dia."LoyaltyNumber" LoyaltyNumber,
+                   dia."PotentialNumber" PotentialNumber,
+                   (
+                        SELECT Max("BasicPrice") FROM "tbl_OfferingPrice"
+                        WHERE "OfferingID" = dia."DrugID" AND "CountryID" = a."CountryID"
+                   ) DrugPrice
+                FROM "tbl_DrugInContact" dia
+                INNER JOIN "tbl_Contact" a ON (a."ID" = dia."ContactID")
+                WHERE dia."ContactID" = ContactID
+            );
+         c1rec CRSR%ROWTYPE;
+         BEGIN
+            OPEN CRSR;
+            LOOP
+               FETCH CRSR  INTO c1rec;
+               EXIT WHEN CRSR%NOTFOUND;
+
+               -- Лояльность
+              BEGIN
+              SELECT LoyaltyID INTO TempLoyaltyID
+               FROM (
+                   SELECT LoyaltyID, "MinValue",
+                        ROW_NUMBER() OVER ( ORDER BY "MinValue" DESC) row_num
+                   FROM (
+                        SELECT dl."LoyaltyID" LoyaltyID,
+                           Sum((
+                                SELECT Max("BasicPrice") FROM "tbl_OfferingPrice"
+                                WHERE "OfferingID" = dia."DrugID" AND "CountryID" = a."CountryID"
+                           ) * dl."MinValue")  "MinValue"
+                        FROM "tbl_DrugInContact" dia
+                        INNER JOIN "tbl_Contact" a ON (a."ID" = dia."ContactID")
+                        INNER JOIN "tbl_DrugLevels" dl ON (dia."DrugID" = dl."OfferingID")
+                        WHERE dia."ContactID" = ContactID AND dl."IsForLoyalty" = 1 AND
+                            dl."SpecialtyID" = SpecialtyID
+                        GROUP BY dl."LoyaltyID", dl."ID"
+                   ) a
+                   WHERE "MinValue"  <= c1rec.LoyaltyPrice
+               ) b WHERE row_num = 1;
+               EXCEPTION
+               WHEN NO_DATA_FOUND THEN
+                       NULL;
+               END;
+               -- Потенциал
+              BEGIN
+              SELECT PotentialID INTO TempPotentialID
+               FROM (
+                       SELECT PotentialID, "MinValue",
+                            ROW_NUMBER() OVER ( ORDER BY "MinValue" DESC) row_num
+                       FROM (
+                        SELECT dl."PotentialID" PotentialID,
+                           Sum((
+                                SELECT Max("BasicPrice") FROM "tbl_OfferingPrice"
+                                WHERE "OfferingID" = dia."DrugID" AND "CountryID" = a."CountryID"
+                           ) * dl."MinValue")  "MinValue"
+                        FROM "tbl_DrugInContact" dia
+                        INNER JOIN "tbl_Contact" a ON (a."ID" = dia."ContactID")
+                        INNER JOIN "tbl_DrugLevels" dl ON (dia."DrugID" = dl."OfferingID")
+                        WHERE dia."ContactID" = ContactID AND dl."IsForPotential" = 1 AND
+                            dl."SpecialtyID" = SpecialtyID
+                        GROUP BY dl."PotentialID", dl."ID"
+                   ) a
+                   WHERE "MinValue"  <= c1rec.PotentialPrice
+                ) b WHERE row_num = 1;
+               EXCEPTION
+               WHEN NO_DATA_FOUND THEN
+                       NULL;
+               END;
+
+           UPDATE "tbl_Contact"
+                SET "LoyaltyID" = TempLoyaltyID
+           WHERE "ID" = ContactID;
+
+
+           UPDATE "tbl_Contact"
+                SET "PotentialID" = TempPotentialID
+           WHERE "ID" = ContactID;
+
+            END LOOP;
+            CLOSE CRSR;
+         END;
+
+     /* Обновление группы клиента в МП */
+    UPDATE "tbl_MedRepInContact"
+        SET "ClientGroupID" = (
+            SELECT "TargetGroupID"
+            FROM "tbl_ClientCategory"
+            WHERE "LoyaltyID" = "tbl_MedRepInContact"."LoyaltyID" AND
+                "PotentialID" = "tbl_MedRepInContact"."PotentialID" AND
+                "CategorisationTypeID" = CategorisationTypeID AND
+                ROWNUM <= 1
+        ),
+        "ClientCategoryID" = (
+            SELECT "ID"
+            FROM "tbl_ClientCategory"
+            WHERE "LoyaltyID" = "tbl_MedRepInContact"."LoyaltyID" AND
+                "PotentialID" = "tbl_MedRepInContact"."PotentialID" AND
+                "CategorisationTypeID" = CategorisationTypeID AND
+                ROWNUM <= 1
+        ),
+        "IntervisitDays" = (
+            SELECT "IntervisitDays"
+            FROM "tbl_ClientCategory"
+            WHERE "LoyaltyID" = "tbl_MedRepInContact"."LoyaltyID" AND
+                "PotentialID" = "tbl_MedRepInContact"."PotentialID" AND
+                "CategorisationTypeID" = CategorisationTypeID AND
+                ROWNUM <= 1
+        )
+    WHERE "ContactID" = ContactID;
+
+     /* Обновление группы клиента, категории и дней между визитами в враче */
+    UPDATE "tbl_Contact"
+        SET "ClientGroupID" = (
+            SELECT "TargetGroupID"
+            FROM "tbl_ClientCategory"
+            WHERE "LoyaltyID" = "tbl_Contact"."LoyaltyID" AND
+                "PotentialID" = "tbl_Contact"."PotentialID" AND
+                "CategorisationTypeID" = CategorisationTypeID AND
+                ROWNUM <= 1
+        )
+    WHERE "ID" = ContactID;
+
+     /*
+     * Категоризация МП и контрагента завершена. Сохранение истории категоризации
+     */
+    INSERT INTO "tbl_MedRepInContactHistory" ("CreatedOn", "ModifiedOn", "CreatedByID", "ModifiedByID",
+        "Date", "PotentialID", "LoyaltyID", "ClientGroupID", "MedRepInContactID")
+    SELECT sysdate(), sysdate(), CurrenUserContactID, CurrenUserContactID,
+        sysdate(), "PotentialID", "LoyaltyID", "ClientGroupID", "ID"
+    FROM "tbl_MedRepInContact" ma
+    WHERE "ContactID" = ContactID AND
+        NOT EXISTS (
+            SELECT *
+            FROM "tbl_MedRepInContactHistory"
+            WHERE NVL("LoyaltyID", '0') = NVL(ma."LoyaltyID", '0') AND NVL("PotentialID", '0') = NVL(ma."PotentialID", '0') AND
+                NVL("ClientGroupID", '0') = NVL(ma."ClientGroupID", '0') AND "MedRepInContactID" = ma."ID" AND
+                "Date" = (SELECT Max("Date") FROM "tbl_MedRepInContactHistory" WHERE "MedRepInContactID" = ma."ID")
+        );
+
+     /*
+     * Сохранение истории категоризации врача
+     */
+    INSERT INTO "tbl_ContactCategoryHistory" ("CreatedOn", "ModifiedOn", "CreatedByID", "ModifiedByID",
+        "Date", "PotentialID", "LoyaltyID", "ClientGroupID", "ContactID")
+    SELECT sysdate(), sysdate(), CurrenUserContactID, CurrenUserContactID,
+        sysdate(), "PotentialID", "LoyaltyID", "ClientGroupID", "ID"
+    FROM "tbl_Contact" a
+    WHERE "ID" = ContactID AND
+        NOT EXISTS (
+            SELECT *
+            FROM "tbl_ContactCategoryHistory"
+            WHERE NVL("LoyaltyID", '0') = NVL(a."LoyaltyID", '0') AND NVL("PotentialID", '0') = NVL(a."PotentialID", '0') AND
+                NVL("ClientGroupID", '0') = NVL(a."ClientGroupID", '0') AND "ContactID" = a."ID" AND
+                "Date" = (SELECT Max("Date") FROM "tbl_ContactCategoryHistory" WHERE "ContactID" = a."ID")
+        );
+
+END "tsp_CategorisationContact";
+/
